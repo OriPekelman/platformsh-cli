@@ -1,0 +1,1 @@
+eval $(platform "_completion --generate-hook")

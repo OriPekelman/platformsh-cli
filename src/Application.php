@@ -57,6 +57,16 @@ class Application extends Console\Application {
     /**
     * {@inheritdoc}
     */
+    protected function getDefaultCommands()
+    {
+       //...
+        $commands[] = new \Stecman\Component\Symfony\Console\BashCompletion\CompletionCommand();
+        return $commands;
+    }
+    
+    /**
+    * {@inheritdoc}
+    */
     protected function getDefaultInputDefinition()
     {
         // We remove the confusing `--ansi` and `--no-ansi` options.
