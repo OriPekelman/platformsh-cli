@@ -82,7 +82,7 @@ Use the 'list' command to get a list of available options and commands:
 The current output of `platform list` is as follows:
 
 ```
-Platform.sh CLI
+Platform.sh CLI version 2.0.2
 
 Global options:
   --help           -h Display this help message
@@ -91,6 +91,7 @@ Global options:
   --version        -V Display this application version
   --yes            -y Answer "yes" to all prompts
   --no             -n Answer "no" to all prompts
+  --session-id        Specify the session ID
   --shell          -s Launch the shell
 
 Available commands:
