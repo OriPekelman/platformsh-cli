@@ -1,0 +1,92 @@
+<?php
+namespace Platformsh\Cli\Console;
+
+use GuzzleHttp\Exception\ClientException;
+use GuzzleHttp\Exception\ConnectException;
+use GuzzleHttp\Exception\ParseException;
+use Platformsh\Cli\Command\PlatformCommand;
+use Platformsh\Cli\Exception\ConnectionFailedException;
+use Platformsh\Cli\Exception\LoginRequiredException;
+use Platformsh\Cli\Exception\PermissionDeniedException;
+use Platformsh\Client\Exception\EnvironmentStateException;
+use Symfony\Component\Console\Event\ConsoleExceptionEvent;
+use Symfony\Component\EventDispatcher\EventSubscriberInterface;
+
+class EventSubscriber implements EventSubscriberInterface
+{
+    /**
+     * {@inheritdoc}
+     */
+    public static function getSubscribedEvents()
+    {
+        return array('console.exception' => 'onException');
+    }
+
+    /**
+     * React to any console exceptions.
+     *
+     * @param ConsoleExceptionEvent    $event
+     */
+    public function onException(ConsoleExceptionEvent $event)
+    {
+        $exception = $event->getException();
+
+        // Replace Guzzle connect exceptions with a friendlier message. This
+        // also prevents the user from seeing two exceptions (one direct from
+        // Guzzle, one from RingPHP).
+        if ($exception instanceof ConnectException && strpos($exception->getMessage(), 'cURL error 6') !== false) {
+            $request = $exception->getRequest();
+            $event->setException(new ConnectionFailedException(
+              "Failed to connect to host: " . $request->getHost()
+              . " \nPlease check your Internet connection.",
+              $request
+            ));
+            $event->stopPropagation();
+        }
+
+        // Handle Guzzle client exceptions, i.e. HTTP 4xx errors.
+        if ($exception instanceof ClientException && ($response = $exception->getResponse())) {
+            $request = $exception->getRequest();
+            try {
+                $response->getBody()->seek(0);
+                $json = $response->json();
+            }
+            catch (ParseException $e) {
+                $json = [];
+            }
+
+            // Create a friendlier message for the OAuth2 "Invalid refresh token"
+            // error.
+            if ($response->getStatusCode() === 400 && isset($json['error_description']) && $json['error_description'] === 'Invalid refresh token') {
+                $event->setException(new LoginRequiredException(
+                    "Invalid refresh token: please log in again.",
+                    $request
+                ));
+                $event->stopPropagation();
+            }
+            elseif ($response->getStatusCode() === 401) {
+                $event->setException(new LoginRequiredException(
+                    "Unauthorized: please log in again.",
+                     $request
+                ));
+                $event->stopPropagation();
+            }
+            elseif ($response->getStatusCode() === 403) {
+                $event->setException(new PermissionDeniedException(
+                  "Permission denied. Check your project or environment permissions.",
+                  $request
+                ));
+                $event->stopPropagation();
+            }
+        }
+
+        // When an environment is found to be in the wrong state, perhaps our
+        // cache is old - we should invalidate it.
+        if ($exception instanceof EnvironmentStateException) {
+            $command = $event->getCommand();
+            if ($command instanceof PlatformCommand) {
+                $command->clearEnvironmentsCache();
+            }
+        }
+    }
+}

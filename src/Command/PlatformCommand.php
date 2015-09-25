@@ -3,6 +3,10 @@
 namespace Platformsh\Cli\Command;
 
 use Doctrine\Common\Cache\FilesystemCache;
+use Doctrine\Common\Cache\VoidCache;
+use Platformsh\Cli\Exception\LoginRequiredException;
+use Platformsh\Cli\Exception\RootNotFoundException;
+use Platformsh\Cli\Helper\FilesystemHelper;
 use Platformsh\Cli\Local\LocalProject;
 use Platformsh\Cli\Local\Toolstack\Drupal;
 use Platformsh\Client\Connection\Connector;
@@ -14,11 +18,13 @@ use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\ArrayInput;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
+use Symfony\Component\Console\Output\ConsoleOutputInterface;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\Output\StreamOutput;
 
 abstract class PlatformCommand extends Command
 {
+    use HasExamplesTrait;
 
     /** @var PlatformClient|null */
     private static $client;
@@ -29,8 +35,17 @@ abstract class PlatformCommand extends Command
     /** @var string */
     protected static $sessionId = 'default';
 
+    /** @var string|null */
+    protected static $apiToken;
+
+    /** @var bool */
+    protected static $interactive = false;
+
     /** @var OutputInterface|null */
     protected $output;
+
+    /** @var OutputInterface|null */
+    protected $stdErr;
 
     protected $envArgName = 'environment';
 
@@ -38,6 +53,7 @@ abstract class PlatformCommand extends Command
     protected $environmentsTtl;
 
     private $hiddenInList = false;
+    private $hiddenAliases = array();
 
     /**
      * The project, selected either by an option or the CWD.
@@ -61,12 +77,30 @@ abstract class PlatformCommand extends Command
      */
     private $projectRoot = false;
 
+    /**
+     * The local project configuration.
+     *
+     * @var array
+     */
+    private $projectConfig = [];
+
     public function __construct($name = null)
     {
         parent::__construct($name);
 
-        $this->projectsTtl = getenv('PLATFORM_CLI_PROJECTS_TTL') ?: 3600;
-        $this->environmentsTtl = getenv('PLATFORM_CLI_ENVIRONMENTS_TTL') ?: 600;
+        $this->projectsTtl = getenv('PLATFORMSH_CLI_PROJECTS_TTL') ?: 3600;
+        $this->environmentsTtl = getenv('PLATFORMSH_CLI_ENVIRONMENTS_TTL') ?: 600;
+
+        if (getenv('PLATFORMSH_CLI_SESSION_ID')) {
+            self::$sessionId = getenv('PLATFORMSH_CLI_SESSION_ID');
+        }
+        if (!isset(self::$apiToken) && getenv('PLATFORMSH_CLI_API_TOKEN')) {
+            self::$apiToken = getenv('PLATFORMSH_CLI_API_TOKEN');
+        }
+        if (!isset(self::$cache)) {
+            // Note: the cache directory is based on self::$sessionId.
+            self::$cache = getenv('PLATFORMSH_CLI_DISABLE_CACHE') ? new VoidCache() : new FilesystemCache($this->getCacheDir());
+        }
     }
 
     /**
@@ -107,19 +141,39 @@ abstract class PlatformCommand extends Command
     {
         if (!isset(self::$client)) {
             $connectorOptions = [];
-            if (getenv('PLATFORM_CLI_ACCOUNTS_SITE')) {
-                $connectorOptions['accounts'] = getenv('PLATFORM_CLI_ACCOUNTS_SITE');
+            if (getenv('PLATFORMSH_CLI_ACCOUNTS_SITE')) {
+                $connectorOptions['accounts'] = getenv('PLATFORMSH_CLI_ACCOUNTS_SITE');
             }
-            $connectorOptions['verify'] = !getenv('PLATFORM_CLI_SKIP_SSL');
-            $connectorOptions['debug'] = (bool) getenv('PLATFORM_CLI_DEBUG');
+            $connectorOptions['verify'] = !getenv('PLATFORMSH_CLI_SKIP_SSL');
+            $connectorOptions['debug'] = (bool) getenv('PLATFORMSH_CLI_DEBUG');
             $connectorOptions['client_id'] = 'platform-cli';
             $connectorOptions['user_agent'] = $this->getUserAgent();
 
-            $connector = new Connector($connectorOptions);
-            $session = $connector->getSession();
+            // Proxy support with the http_proxy or https_proxy environment
+            // variables.
+            $proxies = array();
+            foreach (array('https', 'http') as $scheme) {
+                $proxies[$scheme] = str_replace('http://', 'tcp://', getenv($scheme . '_proxy'));
+            }
+            $proxies = array_filter($proxies);
+            if (count($proxies)) {
+                $connectorOptions['proxy'] = count($proxies) == 1 ? reset($proxies) : $proxies;
+            }
 
-            $session->setId('cli-' . self::$sessionId);
-            $session->setStorage(new File());
+            $connector = new Connector($connectorOptions);
+
+            // If an API token is set, that's all we need to authenticate.
+            if (isset(self::$apiToken)) {
+                $connector->setApiToken(self::$apiToken);
+            }
+            // Otherwise, set up a persistent session to store OAuth2 tokens. By
+            // default, this will be stored in a JSON file:
+            // $HOME/.platformsh/.session/sess-cli-default/sess-cli-default.json
+            else {
+                $session = $connector->getSession();
+                $session->setId('cli-' . self::$sessionId);
+                $session->setStorage(new File());
+            }
 
             self::$client = new PlatformClient($connector);
 
@@ -137,13 +191,8 @@ abstract class PlatformCommand extends Command
     protected function initialize(InputInterface $input, OutputInterface $output)
     {
         $this->output = $output;
-        if ($input->hasOption('session-id') && $input->getOption('session-id')) {
-            self::$sessionId = $input->getOption('session-id');
-        }
-        if (!isset(self::$cache)) {
-            // Note: the cache directory is based on self::$sessionId.
-            self::$cache = new FilesystemCache($this->getCacheDir());
-        }
+        $this->stdErr = $output instanceof ConsoleOutputInterface ? $output->getErrorOutput() : $output;
+        self::$interactive = $input->isInteractive();
     }
 
     /**
@@ -161,8 +210,8 @@ abstract class PlatformCommand extends Command
     {
         $sessionId = 'cli-' . preg_replace('/[\W]+/', '-', self::$sessionId);
 
-        return $this->getHelper('fs')
-                    ->getHomeDirectory() . '/.platformsh/.session/sess-' . $sessionId;
+        $fs = new FilesystemHelper();
+        return $fs->getHomeDirectory() . '/.platformsh/.session/sess-' . $sessionId;
     }
 
     /**
@@ -185,16 +234,10 @@ abstract class PlatformCommand extends Command
      */
     protected function login()
     {
-        if (!$this->output) {
-            throw new \RuntimeException('Login is required but no output is defined');
+        if (!$this->output || !self::$interactive) {
+            throw new LoginRequiredException();
         }
-        $application = $this->getApplication();
-        $command = $application->find('login');
-        $input = new ArrayInput(array(
-          'command' => 'login',
-          '--session-id' => self::$sessionId,
-        ));
-        $exitCode = $command->run($input, $this->output);
+        $exitCode = $this->runOtherCommand('login');
         if ($exitCode) {
             throw new \Exception('Login failed');
         }
@@ -231,12 +274,13 @@ abstract class PlatformCommand extends Command
      *
      * @param string $email    The user's email.
      * @param string $password The user's password.
+     * @param string $totp     The user's TFA one-time password.
      */
-    protected function authenticateUser($email, $password)
+    protected function authenticateUser($email, $password, $totp = null)
     {
         $this->getClient(false)
              ->getConnector()
-             ->logIn($email, $password, true);
+             ->logIn($email, $password, true, $totp);
     }
 
     /**
@@ -248,14 +292,14 @@ abstract class PlatformCommand extends Command
      */
     public function getCurrentProject()
     {
-        if (!$this->getProjectRoot()) {
+        if (!$projectRoot = $this->getProjectRoot()) {
             return false;
         }
 
         $project = false;
-        $config = LocalProject::getProjectConfig($this->getProjectRoot());
+        $config = $this->getProjectConfig($projectRoot);
         if ($config) {
-            $project = $this->getProject($config['id']);
+            $project = $this->getProject($config['id'], isset($config['host']) ? $config['host'] : null);
             // There is a chance that the project isn't available.
             if (!$project) {
                 $filename = LocalProject::getProjectRoot() . '/' . LocalProject::PROJECT_CONFIG;
@@ -271,22 +315,70 @@ abstract class PlatformCommand extends Command
     }
 
     /**
+     * Get the project configuration.
+     *
+     * @param string $projectRoot
+     *
+     * @return array
+     */
+    protected function getProjectConfig($projectRoot)
+    {
+        if (!isset($this->projectConfig[$projectRoot])) {
+            $this->projectConfig[$projectRoot] = LocalProject::getProjectConfig($projectRoot) ?: [];
+        }
+
+        return $this->projectConfig[$projectRoot];
+    }
+
+    /**
+     * Set a value in the project configuration.
+     *
+     * @param string $key
+     * @param mixed $value
+     * @param string $projectRoot
+     */
+    protected function setProjectConfig($key, $value, $projectRoot)
+    {
+        unset($this->projectConfig[$projectRoot]);
+        LocalProject::writeCurrentProjectConfig($key, $value, $projectRoot);
+    }
+
+    /**
      * Get the current environment if the user is in a project directory.
      *
-     * @param Project $project The current project.
+     * @param Project $expectedProject The expected project.
      *
-     * @return Environment|false The current environment
+     * @return Environment|false The current environment.
      */
-    public function getCurrentEnvironment(Project $project)
+    public function getCurrentEnvironment(Project $expectedProject = null)
     {
-        if (!$this->getProjectRoot()) {
+        if (!($projectRoot = $this->getProjectRoot())
+          || !($project = $this->getCurrentProject())
+          || ($expectedProject !== null && $expectedProject->id !== $project->id)) {
             return false;
+        }
+
+        $gitHelper = $this->getHelper('git');
+        $gitHelper->setDefaultRepositoryDir($this->getProjectRoot() . '/' . LocalProject::REPOSITORY_DIR);
+        $currentBranch = $gitHelper->getCurrentBranch();
+
+        // Check if there is a manual mapping set for the current branch.
+        if ($currentBranch) {
+            $config = $this->getProjectConfig($projectRoot);
+            if (!empty($config['mapping'][$currentBranch])) {
+                $environment = $this->getEnvironment($config['mapping'][$currentBranch], $project);
+                if ($environment) {
+                    return $environment;
+                }
+                else {
+                    unset($config['mapping'][$currentBranch]);
+                    $this->setProjectConfig('mapping', $config['mapping'], $projectRoot);
+                }
+            }
         }
 
         // Check whether the user has a Git upstream set to a Platform
         // environment ID.
-        $gitHelper = $this->getHelper('git');
-        $gitHelper->setDefaultRepositoryDir($this->getProjectRoot() . '/' . LocalProject::REPOSITORY_DIR);
         $upstream = $gitHelper->getUpstream();
         if ($upstream && strpos($upstream, '/') !== false) {
             list(, $potentialEnvironment) = explode('/', $upstream, 2);
@@ -298,7 +390,6 @@ abstract class PlatformCommand extends Command
 
         // There is no Git remote set, or it's set to a non-Platform URL.
         // Fall back to trying the current branch name.
-        $currentBranch = $gitHelper->getCurrentBranch();
         if ($currentBranch) {
             $currentBranchSanitized = Environment::sanitizeId($currentBranch);
             $environment = $this->getEnvironment($currentBranchSanitized, $project);
@@ -341,7 +432,7 @@ abstract class PlatformCommand extends Command
             $connector = $this->getClient(false)
                               ->getConnector();
             $client = $connector->getClient();
-            foreach (self::$cache->fetch($cacheKey) as $id => $data) {
+            foreach ((array) self::$cache->fetch($cacheKey) as $id => $data) {
                 $projects[$id] = Project::wrap($data, $data['_endpoint'], $client);
             }
         }
@@ -353,18 +444,37 @@ abstract class PlatformCommand extends Command
      * Return the user's project with the given id.
      *
      * @param string $id
+     * @param string $host
      * @param bool   $refresh
      *
      * @return Project|false
      */
-    protected function getProject($id, $refresh = false)
+    protected function getProject($id, $host = null, $refresh = false)
     {
-        $projects = $this->getProjects($refresh);
-        if (!isset($projects[$id])) {
-            return false;
+        // Allow the specified project to be a full URL.
+        if (strpos($id, '//') !== false) {
+            $url = $id;
+            $id = basename($url);
+            $host = parse_url($url, PHP_URL_HOST);
         }
 
-        return $projects[$id];
+        // Find the project in the user's main project list.
+        $projects = $this->getProjects($refresh);
+        if (isset($projects[$id])) {
+            return $projects[$id];
+        }
+
+        // Get the project directly if a hostname is specified.
+        if (!empty($host)) {
+            $scheme = 'https';
+            if (($pos = strpos($host, '//')) !== false) {
+                $scheme = parse_url($host, PHP_URL_SCHEME);
+                $host = substr($host, $pos + 2);
+            }
+            return $this->getClient()->getProjectDirect($id, $host, $scheme != 'http');
+        }
+
+        return false;
     }
 
     /**
@@ -404,7 +514,7 @@ abstract class PlatformCommand extends Command
                               ->getConnector();
             $endpoint = $project->hasLink('self') ? $project->getLink('self', true) : $project['endpoint'];
             $client = $connector->getClient();
-            foreach (self::$cache->fetch($cacheKey) as $id => $data) {
+            foreach ((array) self::$cache->fetch($cacheKey) as $id => $data) {
                 $environments[$id] = Environment::wrap($data, $endpoint, $client);
             }
         }
@@ -443,6 +553,19 @@ abstract class PlatformCommand extends Command
         }
 
         return $environments[$id];
+    }
+
+    /**
+     * Clear the environments cache for a project.
+     *
+     * Use this after creating/deleting/updating environment(s).
+     *
+     * @param Project $project
+     */
+    public function clearEnvironmentsCache(Project $project = null)
+    {
+        $project = $project ?: $this->getSelectedProject();
+        self::$cache->delete('environments:' . $project->id);
     }
 
     /**
@@ -487,20 +610,18 @@ abstract class PlatformCommand extends Command
     /**
      * @return string|false
      */
-    protected function getProjectRoot()
+    public function getProjectRoot()
     {
         return $this->projectRoot ?: LocalProject::getProjectRoot();
     }
 
     /**
      * Warn the user that the remote environment needs rebuilding.
-     *
-     * @param OutputInterface $output
      */
-    protected function rebuildWarning(OutputInterface $output)
+    protected function rebuildWarning()
     {
-        $output->writeln('<comment>The remote environment must be rebuilt for the change to take effect.</comment>');
-        $output->writeln("Use 'git push' with new commit(s) to trigger a rebuild.");
+        $this->stdErr->writeln('<comment>The remote environment must be rebuilt for the change to take effect.</comment>');
+        $this->stdErr->writeln("Use 'git push' with new commit(s) to trigger a rebuild.");
     }
 
     /**
@@ -529,13 +650,16 @@ abstract class PlatformCommand extends Command
     }
 
     /**
-     * Add the --project option.
+     * Add the --project and --host options.
      *
      * @return self
      */
     protected function addProjectOption()
     {
-        return $this->addOption('project', null, InputOption::VALUE_OPTIONAL, 'The project ID');
+        $this->addOption('project', 'p', InputOption::VALUE_OPTIONAL, 'The project ID');
+        $this->addOption('host', null, InputOption::VALUE_OPTIONAL, "The project's API hostname");
+
+        return $this;
     }
 
     /**
@@ -545,7 +669,7 @@ abstract class PlatformCommand extends Command
      */
     protected function addEnvironmentOption()
     {
-        return $this->addOption('environment', null, InputOption::VALUE_OPTIONAL, 'The environment ID');
+        return $this->addOption('environment', 'e', InputOption::VALUE_OPTIONAL, 'The environment ID');
     }
 
     /**
@@ -560,20 +684,21 @@ abstract class PlatformCommand extends Command
 
     /**
      * @param string $projectId
+     * @param string $host
      *
      * @return Project
      */
-    protected function selectProject($projectId = null)
+    protected function selectProject($projectId = null, $host = null)
     {
         if (!empty($projectId)) {
-            $project = $this->getProject($projectId);
+            $project = $this->getProject($projectId, $host);
             if (!$project) {
                 throw new \RuntimeException('Specified project not found: ' . $projectId);
             }
         } else {
             $project = $this->getCurrentProject();
             if (!$project) {
-                throw new \RuntimeException(
+                throw new RootNotFoundException(
                   "Could not determine the current project."
                   . "\nSpecify it manually using --project or go to a project directory."
                 );
@@ -598,10 +723,17 @@ abstract class PlatformCommand extends Command
         } else {
             $environment = $this->getCurrentEnvironment($this->project);
             if (!$environment) {
-                throw new \RuntimeException(
-                  "Could not determine the current environment."
-                  . "\nSpecify it manually using --environment or go to a project directory."
-                );
+                $message = "Could not determine the current environment.";
+                if ($this->getProjectRoot()) {
+                    throw new \RuntimeException(
+                      $message . "\nSpecify it manually using --environment."
+                    );
+                }
+                else {
+                    throw new RootNotFoundException(
+                      $message . "\nSpecify it manually using --environment or go to a project directory."
+                    );
+                }
             }
         }
 
@@ -610,54 +742,58 @@ abstract class PlatformCommand extends Command
 
     /**
      * @param InputInterface  $input
-     * @param OutputInterface $output
      * @param bool $envNotRequired
+     */
+    protected function validateInput(InputInterface $input, $envNotRequired = null)
+    {
+        // Select the project.
+        $projectId = $input->hasOption('project') ? $input->getOption('project') : null;
+        $projectHost = $input->hasOption('host') ? $input->getOption('host') : null;
+        $this->project = $this->selectProject($projectId, $projectHost);
+
+        // Select the environment.
+        $envOptionName = 'environment';
+        if ($input->hasArgument($this->envArgName) && $input->getArgument($this->envArgName)) {
+            if ($input->hasOption($envOptionName) && $input->getOption($envOptionName)) {
+                throw new \InvalidArgumentException(
+                  sprintf(
+                    "You cannot use both the '%s' argument and the '--%s' option",
+                    $this->envArgName,
+                    $envOptionName
+                  )
+                );
+            }
+            $argument = $input->getArgument($this->envArgName);
+            if (is_array($argument) && count($argument) == 1) {
+                $argument = $argument[0];
+            }
+            if (!is_array($argument)) {
+                $this->environment = $this->selectEnvironment($argument);
+            }
+        } elseif ($input->hasOption($envOptionName)) {
+            if ($envNotRequired && !$input->getOption($envOptionName)) {
+                $this->environment = $this->getCurrentEnvironment($this->project);
+            }
+            else {
+                $this->environment = $this->selectEnvironment($input->getOption($envOptionName));
+            }
+        }
+
+        if ($this->stdErr->getVerbosity() >= OutputInterface::VERBOSITY_DEBUG) {
+            $this->stdErr->writeln("Selected project: " . $this->project['id']);
+            $environmentId = $this->environment ? $this->environment['id'] : '[none]';
+            $this->stdErr->writeln("Selected environment: $environmentId");
+        }
+    }
+
+    /**
+     * Check whether a project is selected.
      *
      * @return bool
      */
-    protected function validateInput(InputInterface $input, OutputInterface $output, $envNotRequired = null)
+    protected function hasSelectedProject()
     {
-        $projectId = $input->hasOption('project') ? $input->getOption('project') : null;
-        try {
-            $this->project = $this->selectProject($projectId);
-            $envOptionName = 'environment';
-            if ($input->hasArgument($this->envArgName) && $input->getArgument($this->envArgName)) {
-                if ($input->hasOption($envOptionName) && $input->getOption($envOptionName)) {
-                    throw new \InvalidArgumentException(
-                      sprintf(
-                        "You cannot use both the '%s' argument and the '--%s' option",
-                        $this->envArgName,
-                        $envOptionName
-                      )
-                    );
-                }
-                $argument = $input->getArgument($this->envArgName);
-                if (is_array($argument) && count($argument) == 1) {
-                    $argument = $argument[0];
-                }
-                if (!is_array($argument)) {
-                    $this->environment = $this->selectEnvironment($argument);
-                }
-            } elseif ($input->hasOption($envOptionName)) {
-                if ($envNotRequired && !$input->getOption($envOptionName)) {
-                    $this->environment = $this->getCurrentEnvironment($this->project);
-                }
-                else {
-                    $this->environment = $this->selectEnvironment($input->getOption($envOptionName));
-                }
-            }
-        } catch (\RuntimeException $e) {
-            $output->writeln('<error>' . $e->getMessage() . '</error>');
-
-            return false;
-        }
-        if ($output->getVerbosity() >= OutputInterface::VERBOSITY_DEBUG) {
-            $output->writeln("Selected project: " . $this->project['id']);
-            $environmentId = $this->environment ? $this->environment['id'] : '[none]';
-            $output->writeln("Selected environment: $environmentId");
-        }
-
-        return true;
+        return !empty($this->project);
     }
 
     /**
@@ -704,5 +840,66 @@ abstract class PlatformCommand extends Command
         }
 
         return $this->environment;
+    }
+
+    /**
+     * Run another CLI command.
+     *
+     * @param string         $name
+     *   The name of the other command.
+     * @param array          $arguments
+     *   Arguments for the other command.
+     * @param InputInterface $input
+     *   The input to the current command.
+     *
+     * @return int
+     */
+    protected function runOtherCommand($name, array $arguments = array(), InputInterface $input = null)
+    {
+        /** @var PlatformCommand $command */
+        $command = $this->getApplication()->find($name);
+        // Pass on the project root to the other command.
+        if ($root = $this->getProjectRoot()) {
+            $command->setProjectRoot($root);
+        }
+
+        // Pass on interactivity arguments to the other command.
+        if ($input) {
+            $arguments += array(
+              '--yes' => $input->getOption('yes'),
+              '--no' => $input->getOption('no'),
+            );
+        }
+
+        $cmdInput = new ArrayInput(array('command' => $name) + $arguments);
+
+        return $command->run($cmdInput, $this->output);
+    }
+
+    /**
+     * Add aliases that should be hidden from help.
+     *
+     * @see parent::setAliases()
+     *
+     * @param array $hiddenAliases
+     *
+     * @return self
+     */
+    protected function setHiddenAliases(array $hiddenAliases)
+    {
+        $this->hiddenAliases = $hiddenAliases;
+        $this->setAliases(array_merge($this->getAliases(), $hiddenAliases));
+
+        return $this;
+    }
+
+    /**
+     * Get aliases that should be visible in help.
+     *
+     * @return array
+     */
+    public function getVisibleAliases()
+    {
+        return array_diff($this->getAliases(), $this->hiddenAliases);
     }
 }

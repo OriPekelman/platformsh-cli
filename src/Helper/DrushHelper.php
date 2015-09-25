@@ -45,6 +45,30 @@ class DrushHelper extends Helper
     }
 
     /**
+     * Get the installed Drush version.
+     *
+     * @return string
+     *
+     * @throws \Exception
+     */
+    public function getVersion()
+    {
+        static $version;
+        if (isset($version)) {
+            return $version;
+        }
+        exec($this->getDrushExecutable() . ' --version', $drushVersion, $returnCode);
+        if ($returnCode > 0) {
+            $message = $returnCode == 127 ? 'Error finding Drush version' : 'Drush is not installed';
+            throw new \Exception($message, $returnCode);
+        }
+        $versionParts = explode(':', $drushVersion[0], 2);
+        $version = trim($versionParts[1]);
+
+        return $version;
+    }
+
+    /**
      * @param string $minVersion
      * @param bool   $attemptInstall
      *
@@ -52,25 +76,27 @@ class DrushHelper extends Helper
      */
     public function ensureInstalled($minVersion = '6', $attemptInstall = true)
     {
-        exec($this->getDrushExecutable() . ' --version', $drushVersion, $returnCode);
-        if ($returnCode && $returnCode === 127) {
-            if ($attemptInstall && $this->install()) {
-                $this->ensureInstalled($minVersion, false);
+        try {
+            $version = $this->getVersion();
+        }
+        catch (\Exception $e) {
+            if ($e->getCode() === 127) {
+                // Retry installing, if the default Drush does not exist.
+                if ($attemptInstall && !getenv('PLATFORMSH_CLI_DRUSH') && $this->install()) {
+                    $this->ensureInstalled($minVersion, false);
 
-                return;
+                    return;
+                }
             }
-            throw new \Exception('Drush must be installed');
-        } elseif ($returnCode) {
-            throw new \Exception('A Drush error occurred');
+
+            throw $e;
         }
         if (!$minVersion) {
             return;
         }
-        $versionParts = explode(':', $drushVersion[0]);
-        $versionNumber = trim($versionParts[1]);
-        if (version_compare($versionNumber, $minVersion, '<')) {
+        if (version_compare($version, $minVersion, '<')) {
             throw new \Exception(
-              sprintf('Drush version %s found, but %s (or later) is required', $versionNumber, $minVersion)
+              sprintf('Drush version %s found, but %s (or later) is required', $version, $minVersion)
             );
         }
     }
@@ -128,12 +154,12 @@ class DrushHelper extends Helper
      */
     public function getDrushExecutable()
     {
-        if (getenv('PLATFORM_CLI_DRUSH')) {
-            return getenv('PLATFORM_CLI_DRUSH');
+        if (getenv('PLATFORMSH_CLI_DRUSH')) {
+            return getenv('PLATFORMSH_CLI_DRUSH');
         }
 
         $executable = 'drush';
-        if (strpos(PHP_OS, 'WIN') !== false && ($fullPath = exec('where drush'))) {
+        if (strpos(PHP_OS, 'WIN') !== false && ($fullPath = shell_exec('where drush'))) {
             $executable = $fullPath;
         }
 
@@ -171,13 +197,14 @@ class DrushHelper extends Helper
      * @param Project       $project      The project
      * @param string        $projectRoot  The project root
      * @param Environment[] $environments The environments
-     * @param bool          $merge        Whether to merge existing alias settings.
+     * @param string        $original     The original group name
+     * @param bool          $merge        Whether to merge existing alias settings
      *
      * @throws \Exception
      *
      * @return bool Whether any aliases have been created.
      */
-    public function createAliases(Project $project, $projectRoot, $environments, $merge = true)
+    public function createAliases(Project $project, $projectRoot, $environments, $original = null, $merge = true)
     {
         $config = LocalProject::getProjectConfig($projectRoot);
         $group = !empty($config['alias-group']) ? $config['alias-group'] : $project['id'];
@@ -193,13 +220,20 @@ class DrushHelper extends Helper
             throw new \Exception("Drush alias file not writable: $filename");
         }
 
-        // Include the alias file so that the user's own modifications can be
-        // merged.
+        // Include the previous alias file(s) so that the user's own
+        // modifications can be merged. This may create a PHP parse error for
+        // invalid syntax, but in that case the user could not run Drush anyway.
         $aliases = array();
-        if (file_exists($filename) && $merge) {
-            // This may create a PHP parse error for invalid syntax, but in
-            // that case the user could not run Drush anyway.
-            include $filename;
+        $originalFiles = array($filename);
+        if ($original) {
+            array_unshift($originalFiles, $drushDir . '/' . $original . '.aliases.drushrc.php');
+        }
+        if ($merge) {
+            foreach ($originalFiles as $originalFile) {
+                if (file_exists($originalFile)) {
+                    include $originalFile;
+                }
+            }
         }
 
         // Generate aliases for the remote environments.
@@ -315,8 +349,14 @@ class DrushHelper extends Helper
           'uri' => $environment->getLink('public-url'),
           'remote-host' => $sshUrl['host'],
           'remote-user' => $sshUrl['user'],
+          // @todo can this be dynamic, based on an env var? see https://github.com/drush-ops/drush/issues/1370
           'root' => '/app/public',
           self::AUTO_REMOVE_KEY => true,
+          'command-specific' => array(
+              'site-install' => array(
+                  'sites-subdir' => 'default',
+              ),
+          ),
         );
     }
 

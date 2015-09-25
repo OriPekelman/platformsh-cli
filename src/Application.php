@@ -1,7 +1,7 @@
 <?php
-
 namespace Platformsh\Cli;
 
+use Platformsh\Cli\Console\EventSubscriber;
 use Platformsh\Cli\Helper\DrushHelper;
 use Platformsh\Cli\Helper\FilesystemHelper;
 use Platformsh\Cli\Helper\GitHelper;
@@ -16,6 +16,7 @@ use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\Shell;
+use Symfony\Component\EventDispatcher\EventDispatcher;
 
 class Application extends ParentApplication
 {
@@ -25,13 +26,17 @@ class Application extends ParentApplication
      */
     public function __construct()
     {
-        parent::__construct('Platform.sh CLI', '2.0.2');
+        parent::__construct('Platform.sh CLI', '2.4.6');
 
         $this->setDefaultTimezone();
 
         $this->addCommands($this->getCommands());
 
         $this->setDefaultCommand('welcome');
+
+        $dispatcher = new EventDispatcher();
+        $dispatcher->addSubscriber(new EventSubscriber());
+        $this->setDispatcher($dispatcher);
     }
 
     /**
@@ -49,7 +54,6 @@ class Application extends ParentApplication
             new InputOption('--version', '-V', InputOption::VALUE_NONE, 'Display this application version'),
             new InputOption('--yes', '-y', InputOption::VALUE_NONE, 'Answer "yes" to all prompts'),
             new InputOption('--no', '-n', InputOption::VALUE_NONE, 'Answer "no" to all prompts'),
-            new InputOption('--session-id', null, InputOption::VALUE_OPTIONAL, 'Specify the session ID'),
             new InputOption('--shell', '-s', InputOption::VALUE_NONE, 'Launch the shell'),
           )
         );
@@ -87,57 +91,65 @@ class Application extends ParentApplication
      */
     protected function getCommands()
     {
-        $commands = array();
+        static $commands = array();
+        if (count($commands)) {
+            return $commands;
+        }
+
         $commands[] = new Command\CompletionCommand();
-        $commands[] = new Command\PlatformLogoutCommand();
-        $commands[] = new Command\PlatformLoginCommand();
         $commands[] = new Command\DocsCommand();
-        $commands[] = new Command\ProjectListCommand();
-        $commands[] = new Command\DomainAddCommand();
-        $commands[] = new Command\DomainDeleteCommand();
-        $commands[] = new Command\DomainListCommand();
-        $commands[] = new Command\EnvironmentActivateCommand();
-        $commands[] = new Command\ActivityListCommand();
-        $commands[] = new Command\ActivityLogCommand();
-        $commands[] = new Command\EnvironmentBackupCommand();
-        $commands[] = new Command\EnvironmentBranchCommand();
-        $commands[] = new Command\EnvironmentCheckoutCommand();
-        $commands[] = new Command\EnvironmentDeleteCommand();
-        $commands[] = new Command\EnvironmentDrushCommand();
-        $commands[] = new Command\EnvironmentHttpAccessCommand();
-        $commands[] = new Command\EnvironmentListCommand();
-        $commands[] = new Command\EnvironmentMetadataCommand();
-        $commands[] = new Command\EnvironmentMergeCommand();
-        $commands[] = new Command\EnvironmentRelationshipsCommand();
-        $commands[] = new Command\EnvironmentRestoreCommand();
-        $commands[] = new Command\EnvironmentRoutesCommand();
-        $commands[] = new Command\EnvironmentSshCommand();
-        $commands[] = new Command\EnvironmentSqlCommand();
-        $commands[] = new Command\EnvironmentSqlDumpCommand();
-        $commands[] = new Command\EnvironmentSynchronizeCommand();
-        $commands[] = new Command\EnvironmentUrlCommand();
-        $commands[] = new Command\EnvironmentVariableDeleteCommand();
-        $commands[] = new Command\EnvironmentVariableGetCommand();
-        $commands[] = new Command\EnvironmentVariableSetCommand();
-        $commands[] = new Command\IntegrationAddCommand();
-        $commands[] = new Command\IntegrationDeleteCommand();
-        $commands[] = new Command\IntegrationGetCommand();
-        $commands[] = new Command\IntegrationUpdateCommand();
-        $commands[] = new Command\LocalBuildCommand();
-        $commands[] = new Command\LocalCleanCommand();
-        $commands[] = new Command\LocalDrushAliasesCommand();
-        $commands[] = new Command\LocalDirCommand();
-        $commands[] = new Command\ProjectGetCommand();
-        $commands[] = new Command\LocalInitCommand();
-        $commands[] = new Command\ProjectMetadataCommand();
-        $commands[] = new Command\SshKeyAddCommand();
-        $commands[] = new Command\SshKeyDeleteCommand();
-        $commands[] = new Command\SshKeyListCommand();
+        $commands[] = new Command\Activity\ActivityListCommand();
+        $commands[] = new Command\Activity\ActivityLogCommand();
+        $commands[] = new Command\Auth\LogoutCommand();
+        $commands[] = new Command\Auth\LoginCommand();
+        $commands[] = new Command\Domain\DomainAddCommand();
+        $commands[] = new Command\Domain\DomainDeleteCommand();
+        $commands[] = new Command\Domain\DomainListCommand();
+        $commands[] = new Command\Environment\EnvironmentActivateCommand();
+        $commands[] = new Command\Environment\EnvironmentBranchCommand();
+        $commands[] = new Command\Environment\EnvironmentCheckoutCommand();
+        $commands[] = new Command\Environment\EnvironmentDeleteCommand();
+        $commands[] = new Command\Environment\EnvironmentDrushCommand();
+        $commands[] = new Command\Environment\EnvironmentHttpAccessCommand();
+        $commands[] = new Command\Environment\EnvironmentListCommand();
+        $commands[] = new Command\Environment\EnvironmentMetadataCommand();
+        $commands[] = new Command\Environment\EnvironmentMergeCommand();
+        $commands[] = new Command\Environment\EnvironmentRelationshipsCommand();
+        $commands[] = new Command\Environment\EnvironmentRoutesCommand();
+        $commands[] = new Command\Environment\EnvironmentSshCommand();
+        $commands[] = new Command\Environment\EnvironmentSqlCommand();
+        $commands[] = new Command\Environment\EnvironmentSqlDumpCommand();
+        $commands[] = new Command\Environment\EnvironmentSynchronizeCommand();
+        $commands[] = new Command\Environment\EnvironmentUrlCommand();
+        $commands[] = new Command\Environment\EnvironmentSetRemoteCommand();
+        $commands[] = new Command\Integration\IntegrationAddCommand();
+        $commands[] = new Command\Integration\IntegrationDeleteCommand();
+        $commands[] = new Command\Integration\IntegrationGetCommand();
+        $commands[] = new Command\Integration\IntegrationUpdateCommand();
+        $commands[] = new Command\Local\LocalBuildCommand();
+        $commands[] = new Command\Local\LocalCleanCommand();
+        $commands[] = new Command\Local\LocalDrushAliasesCommand();
+        $commands[] = new Command\Local\LocalDirCommand();
+        $commands[] = new Command\Local\LocalInitCommand();
+        $commands[] = new Command\Project\ProjectGetCommand();
+        $commands[] = new Command\Project\ProjectListCommand();
+        $commands[] = new Command\Project\ProjectMetadataCommand();
+        $commands[] = new Command\Self\SelfBuildCommand();
+        $commands[] = new Command\Self\SelfUpdateCommand();
+        $commands[] = new Command\Snapshot\SnapshotCreateCommand();
+        $commands[] = new Command\Snapshot\SnapshotListCommand();
+        $commands[] = new Command\Snapshot\SnapshotRestoreCommand();
+        $commands[] = new Command\SshKey\SshKeyAddCommand();
+        $commands[] = new Command\SshKey\SshKeyDeleteCommand();
+        $commands[] = new Command\SshKey\SshKeyListCommand();
         $commands[] = new Command\SubscriptionMetadataCommand();
-        $commands[] = new Command\UserAddCommand();
-        $commands[] = new Command\UserDeleteCommand();
-        $commands[] = new Command\UserListCommand();
-        $commands[] = new Command\UserRoleCommand();
+        $commands[] = new Command\User\UserAddCommand();
+        $commands[] = new Command\User\UserDeleteCommand();
+        $commands[] = new Command\User\UserListCommand();
+        $commands[] = new Command\User\UserRoleCommand();
+        $commands[] = new Command\Variable\VariableDeleteCommand();
+        $commands[] = new Command\Variable\VariableGetCommand();
+        $commands[] = new Command\Variable\VariableSetCommand();
         $commands[] = new Command\WelcomeCommand();
         $commands[] = new Command\WebCommand();
 

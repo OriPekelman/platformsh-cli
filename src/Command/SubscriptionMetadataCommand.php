@@ -25,19 +25,20 @@ class SubscriptionMetadataCommand extends PlatformCommand
           ->setDescription('Read metadata for a subscription');
         $this->addProjectOption();
         $this->setHiddenInList();
+        $this->addExample('View all subscription metadata')
+          ->addExample('View the subscription status', 'status')
+          ->addExample('View the storage limit (in MiB)', 'storage');
     }
 
     protected function execute(InputInterface $input, OutputInterface $output)
     {
-        if (!$this->validateInput($input, $output)) {
-            return 1;
-        }
+        $this->validateInput($input);
 
         $project = $this->getSelectedProject();
         $subscription = $this->getClient()
           ->getSubscription($project->getSubscriptionId());
         if (!$subscription) {
-            $output->writeln("Subscription not found");
+            $this->stdErr->writeln("Subscription not found");
 
             return 1;
         }
@@ -46,7 +47,7 @@ class SubscriptionMetadataCommand extends PlatformCommand
         $property = $input->getArgument('property');
 
         if (!$property) {
-            return $this->listProperties($subscription, $output);
+            return $this->listProperties($subscription);
         }
 
         $output->writeln(
@@ -61,15 +62,14 @@ class SubscriptionMetadataCommand extends PlatformCommand
 
     /**
      * @param Subscription    $subscription
-     * @param OutputInterface $output
      *
      * @return int
      */
-    protected function listProperties(Subscription $subscription, OutputInterface $output)
+    protected function listProperties(Subscription $subscription)
     {
-        $output->writeln("Metadata for the subscription <info>" . $subscription->id . "</info>:");
+        $this->stdErr->writeln("Metadata for the subscription <info>" . $subscription->id . "</info>:");
 
-        $table = new Table($output);
+        $table = new Table($this->output);
         $table->setHeaders(array("Property", "Value"));
         foreach ($subscription->getProperties() as $key => $value) {
             $value = $this->formatter->format($value, $key);

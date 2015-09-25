@@ -2,8 +2,6 @@ The **Platform.sh CLI** is the official command-line interface for [Platform.sh]
 
 [![Build Status](https://travis-ci.org/platformsh/platformsh-cli.svg)](https://travis-ci.org/platformsh/platformsh-cli)
 
-Alternative README versions: [`master`](https://github.com/platformsh/platformsh-cli/blob/master/README.md),   [`1.x`](https://github.com/platformsh/platformsh-cli/blob/1.x/README.md)
-
 ### Requirements
 
 * Operating system: Linux, OS X, Windows Vista, Windows 7 (any), or Windows 8 Pro (Win8 Standard does not work due to an issue with symlink permissions)
@@ -55,17 +53,9 @@ Start a new shell or type `source <filename>` to load the new configuration.
 
 ### Updating
 
-New releases of the CLI are made regularly. You can update with this command:
+New releases of the CLI are made regularly. Update with this command:
 
     composer global update
-
-If you want to change the version that you are using - for example to upgrade
-between major versions (such as `1.x.x` to `2.x.x`) - it may be more effective
-to remove and re-install:
-
-    composer global remove platformsh/cli
-    composer global update
-    composer global require platformsh/cli:@stable
 
 ### Usage
 
@@ -100,6 +90,7 @@ Available commands:
   list                                      Lists commands
   login                                     Log in to Platform.sh
   logout                                    Log out of Platform.sh
+  self-update (up)                          Update the CLI to the latest version
   web                                       Open the Platform.sh Web UI
 activity
   activity:list (activities)                Get the most recent activities for an environment
@@ -110,7 +101,6 @@ domain
   domain:list (domains)                     Get a list of all domains
 environment
   environment:activate                      Activate an environment
-  environment:backup                        Make a backup of an environment
   environment:branch (branch)               Branch an environment
   environment:checkout (checkout)           Check out an environment
   environment:delete                        Delete an environment
@@ -120,8 +110,8 @@ environment
   environment:merge (merge)                 Merge an environment
   environment:metadata                      Read or set metadata for an environment
   environment:relationships (relationships) List an environment's relationships
-  environment:restore                       Restore an environment backup
   environment:routes (routes)               List an environment's routes
+  environment:set-remote                    Set the remote environment to track for a branch
   environment:sql (sql)                     Run SQL on the remote database
   environment:sql-dump (sql-dump)           Create a local dump of the remote database
   environment:ssh (ssh)                     SSH to the current environment
@@ -141,6 +131,10 @@ project
   project:get (get)                         Clone and build a project locally
   project:list (projects)                   Get a list of all active projects
   project:metadata                          Read or set metadata for a project
+snapshot
+  snapshot:create                           Make a snapshot of an environment
+  snapshot:list (snapshots)                 List available snapshots of an environment
+  snapshot:restore                          Restore an environment snapshot
 ssh-key
   ssh-key:add                               Add a new SSH key
   ssh-key:delete                            Delete an SSH key
@@ -163,6 +157,15 @@ The CLI caches details of your projects and their environments. These caches
 could become out-of-date. You can get a fresh list of projects or environments
 with the `platform projects` and `platform environments` commands.
 
-### Credits
+### Customization
 
-* Maintained by [Commerce Guys](https://commerceguys.com).
+You can configure the CLI via these environment variables:
+
+* `PLATFORMSH_CLI_API_TOKEN`: an API token to use for all requests
+* `PLATFORMSH_CLI_DEBUG`: set to 1 to enable cURL debugging
+* `PLATFORMSH_CLI_DISABLE_CACHE`: set to 1 to disable caching
+* `PLATFORMSH_CLI_DRUSH`: configure the Drush executable to use (default 'drush')
+* `PLATFORMSH_CLI_ENVIRONMENTS_TTL`: the cache TTL for environments, in seconds (default 600)
+* `PLATFORMSH_CLI_PROJECTS_TTL`: the cache TTL for projects, in seconds (default 3600)
+* `PLATFORMSH_CLI_SESSION_ID`: change user (default 'default')
+* `http_proxy` or `https_proxy`: specify a proxy for connecting to Platform.sh

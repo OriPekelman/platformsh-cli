@@ -1,6 +1,7 @@
 <?php
 namespace Platformsh\Cli\Local;
 
+use Platformsh\Cli\Exception\InvalidConfigException;
 use Platformsh\Cli\Helper\FilesystemHelper;
 use Platformsh\Cli\Helper\GitHelper;
 use Platformsh\Cli\Helper\ShellHelper;
@@ -8,6 +9,7 @@ use Platformsh\Cli\Local\Toolstack\ToolstackInterface;
 use Symfony\Component\Console\Output\NullOutput;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Finder\Finder;
+use Symfony\Component\Yaml\Exception\ParseException;
 use Symfony\Component\Yaml\Parser;
 
 class LocalBuild
@@ -15,7 +17,7 @@ class LocalBuild
 
     // Some changes may not be backwards-compatible with previous build
     // archives. Increment this number as breaking changes are released.
-    const BUILD_VERSION = 1;
+    const BUILD_VERSION = 2;
 
     protected $settings;
     protected $output;
@@ -31,6 +33,7 @@ class LocalBuild
           new Toolstack\Drupal(),
           new Toolstack\Symfony(),
           new Toolstack\Composer(),
+          new Toolstack\NoToolstack(),
         );
     }
 
@@ -50,19 +53,41 @@ class LocalBuild
     }
 
     /**
+     * Build a normal Platform.sh project.
+     *
      * @param string $projectRoot The absolute path to the project root.
+     * @param string $sourceDir   The absolute path to the source directory.
+     * @param string $destination Where the web root(s) will be linked (absolute
+     *                            path).
+     *
+     * @return bool
+     */
+    public function buildProject($projectRoot, $sourceDir = null, $destination = null)
+    {
+        $this->settings['projectRoot'] = $projectRoot;
+        $sourceDir = $sourceDir ?: $projectRoot . '/' . LocalProject::REPOSITORY_DIR;
+        $destination = $destination ?: $projectRoot . '/' . LocalProject::WEB_ROOT;
+
+        return $this->build($sourceDir, $destination);
+    }
+
+    /**
+     * Build a project from any source directory, targeting any destination.
+     *
+     * @param string $sourceDir   The absolute path to the source directory.
+     * @param string $destination Where the web root(s) will be linked (absolute
+     *                            path).
      * @param array  $apps        An array of application names to build.
      *
      * @throws \Exception on failure
      *
      * @return bool
      */
-    public function buildProject($projectRoot, array $apps = array())
+    public function build($sourceDir, $destination, array $apps = array())
     {
-        $repositoryRoot = $projectRoot . '/' . LocalProject::REPOSITORY_DIR;
         $success = true;
         $identifiers = array();
-        foreach ($this->getApplications($repositoryRoot) as $identifier => $appRoot) {
+        foreach ($this->getApplications($sourceDir) as $identifier => $appRoot) {
             $appConfig = $this->getAppConfig($appRoot);
             $appIdentifier = isset($appConfig['name']) ? $appConfig['name'] : $identifier;
             $appConfig['_identifier'] = $appIdentifier;
@@ -70,7 +95,7 @@ class LocalBuild
             if ($apps && !in_array($appIdentifier, $apps)) {
                 continue;
             }
-            $success = $this->buildApp($appRoot, $projectRoot, $appConfig) && $success;
+            $success = $this->buildApp($appRoot, $sourceDir, $destination, $appConfig) && $success;
         }
         $notFounds = array_diff($apps, $identifiers);
         if ($notFounds) {
@@ -79,11 +104,18 @@ class LocalBuild
             }
         }
         if (empty($this->settings['noClean'])) {
-            if ($this->output->isVerbose()) {
+            if (!empty($this->settings['projectRoot'])) {
                 $this->output->writeln("Cleaning up...");
+                $this->cleanBuilds($this->settings['projectRoot']);
+                $this->cleanArchives($this->settings['projectRoot']);
             }
-            $this->cleanBuilds($projectRoot);
-            $this->cleanArchives($projectRoot);
+            else {
+                $buildsDir = $sourceDir . '/' . LocalProject::BUILD_DIR;
+                if (is_dir($buildsDir)) {
+                    $this->output->writeln("Cleaning up...");
+                    $this->cleanDirectory($buildsDir);
+                }
+            }
         }
 
         return $success;
@@ -101,6 +133,7 @@ class LocalBuild
         $finder = new Finder();
         $finder->in($repositoryRoot)
                ->ignoreDotFiles(false)
+               ->notPath('builds')
                ->name('.platform.app.yaml')
                ->depth('> 0')
                ->depth('< 5');
@@ -130,8 +163,36 @@ class LocalBuild
     {
         $config = array();
         if (file_exists($appRoot . '/.platform.app.yaml')) {
-            $parser = new Parser();
-            $config = (array) $parser->parse(file_get_contents($appRoot . '/.platform.app.yaml'));
+            try {
+                $parser = new Parser();
+                $config = (array) $parser->parse(file_get_contents($appRoot . '/.platform.app.yaml'));
+            }
+            catch (ParseException $e) {
+                throw new InvalidConfigException(
+                  "Parse error in file '$appRoot/.platform.app.yaml'. \n" . $e->getMessage()
+                );
+            }
+        }
+
+        return $this->normalizeConfig($config);
+    }
+
+    /**
+     * Normalize an application's configuration.
+     *
+     * @param array $config
+     *
+     * @return array
+     */
+    public function normalizeConfig(array $config)
+    {
+        // Backwards compatibility with old config format: toolstack is changed
+        // to application type and build['flavor'].
+        if (isset($config['toolstack'])) {
+            if (!strpos($config['toolstack'], ':')) {
+                throw new InvalidConfigException("Invalid value for 'toolstack'");
+            }
+            list($config['type'], $config['build']['flavor']) = explode(':', $config['toolstack'], 2);
         }
 
         return $config;
@@ -150,9 +211,26 @@ class LocalBuild
     public function getToolstack($appRoot, array $appConfig = array())
     {
         $toolstackChoice = false;
-        if (isset($appConfig['toolstack'])) {
-            $toolstackChoice = $appConfig['toolstack'];
+
+        // For now, we reconstruct a toolstack string based on the 'type' and
+        // 'build.flavor' config keys.
+        if (isset($appConfig['type'])) {
+            list($stack, ) = explode(':', $appConfig['type'], 2);
+            $flavor = isset($appConfig['build']['flavor']) ? $appConfig['build']['flavor'] : 'default';
+
+            // Toolstack classes for HHVM are the same as PHP.
+            if ($stack === 'hhvm') {
+                $stack = 'php';
+            }
+
+            $toolstackChoice = "$stack:$flavor";
+
+            // Alias php:default to php:composer.
+            if ($toolstackChoice === 'php:default') {
+                $toolstackChoice = 'php:composer';
+            }
         }
+
         foreach (self::getToolstacks() as $toolstack) {
             $key = $toolstack->getKey();
             if ((!$toolstackChoice && $toolstack->detect($appRoot))
@@ -212,7 +290,7 @@ class LocalBuild
         }
 
         // Include relevant build settings.
-        $irrelevant = array('environmentId', 'appName', 'multiApp', 'noClean', 'verbosity', 'drushConcurrency');
+        $irrelevant = array('environmentId', 'appName', 'multiApp', 'noClean', 'verbosity', 'drushConcurrency', 'projectRoot');
         $settings = array_filter(array_diff_key($this->settings, array_flip($irrelevant)));
         $hashes[] = serialize($settings);
 
@@ -224,16 +302,17 @@ class LocalBuild
 
     /**
      * @param string $appRoot
-     * @param string $projectRoot
+     * @param string $sourceDir
+     * @param string $destination
      * @param array  $appConfig
      *
      * @return bool
      */
-    protected function buildApp($appRoot, $projectRoot, array $appConfig = array())
+    protected function buildApp($appRoot, $sourceDir, $destination, array $appConfig = array())
     {
         $verbose = $this->output->isVerbose();
 
-        $multiApp = $appRoot != $projectRoot . '/' . LocalProject::REPOSITORY_DIR;
+        $multiApp = $appRoot != $sourceDir;
         $appName = isset($appConfig['name']) ? $appConfig['name'] : false;
         $appIdentifier = $appName ?: $appConfig['_identifier'];
 
@@ -244,79 +323,82 @@ class LocalBuild
         if ($multiApp) {
             $buildName .= '--' . str_replace('/', '-', $appIdentifier);
         }
-        $buildDir = $projectRoot . '/' . LocalProject::BUILD_DIR . '/' . $buildName;
+
+        if (!empty($this->settings['projectRoot'])) {
+            $buildDir = $this->settings['projectRoot'] . '/' . LocalProject::BUILD_DIR . '/' . $buildName;
+        }
+        else {
+            $buildDir = $sourceDir . '/' . LocalProject::BUILD_DIR . '/' . $buildName;
+        }
 
         // Get the configured document root.
         $documentRoot = $this->getDocumentRoot($appConfig);
 
         $toolstack = $this->getToolstack($appRoot, $appConfig);
 
-        if ($toolstack) {
-            $toolstack->setOutput($this->output);
+        if (!$toolstack) {
+            $this->output->writeln("Toolstack not found for application <error>$appIdentifier</error>");
 
-            $buildSettings = $this->settings + array(
-                'multiApp' => $multiApp,
-                'appName' => $appName,
-              );
-            $toolstack->prepare($buildDir, $documentRoot, $appRoot, $projectRoot, $buildSettings);
-
-            $archive = false;
-            if (empty($this->settings['noArchive']) && empty($this->settings['noCache'])) {
-                $treeId = $this->getTreeId($appRoot);
-                if ($treeId) {
-                    if ($verbose) {
-                        $this->output->writeln("Tree ID: $treeId");
-                    }
-                    $archive = $projectRoot . '/' . LocalProject::ARCHIVE_DIR . '/' . $treeId . '.tar.gz';
-                }
-            }
-
-            if ($archive && file_exists($archive)) {
-                $message = "Extracting archive for application <info>$appIdentifier</info>";
-                $message .= '...';
-                $this->output->writeln($message);
-                $this->fsHelper->extractArchive($archive, $buildDir);
-            } else {
-                $message = "Building application <info>$appIdentifier</info>";
-                if ($key = $toolstack->getKey()) {
-                    $message .= " using the toolstack <info>$key</info>";
-                }
-                $this->output->writeln($message);
-
-                $toolstack->build();
-
-                // We can only run post-build hooks for apps that actually have
-                // a separate build directory.
-                if (file_exists($buildDir)) {
-                    if ($this->runPostBuildHooks($appConfig, $buildDir) === false) {
-                        // The user may not care if build hooks fail, but we should
-                        // not archive the result.
-                        $archive = false;
-                    }
-                }
-                else {
-                    $this->warnAboutHooks($appConfig, 'build');
-                }
-
-                if ($archive && $toolstack->canArchive()) {
-                    $this->output->writeln("Saving build archive...");
-                    if (!is_dir(dirname($archive))) {
-                        mkdir(dirname($archive));
-                    }
-                    $this->fsHelper->archiveDir($buildDir, $archive);
-                }
-            }
-
-            $toolstack->install();
-
-            $webRoot = $toolstack->getWebRoot();
-        } else {
-            $webRoot = "$appRoot/$documentRoot";
-            if ($documentRoot === 'public' && !is_dir($webRoot)) {
-                $webRoot = $appRoot;
-            }
-            $this->warnAboutHooks($appConfig, 'build');
+            return false;
         }
+
+        $toolstack->setOutput($this->output);
+
+        $buildSettings = $this->settings + array(
+            'multiApp' => $multiApp,
+            'appName' => $appName,
+          );
+        $toolstack->prepare($buildDir, $documentRoot, $appRoot, $sourceDir, $buildSettings);
+
+        $archive = false;
+        if (empty($this->settings['noArchive']) && empty($this->settings['noCache']) && !empty($this->settings['projectRoot'])) {
+            $treeId = $this->getTreeId($appRoot);
+            if ($treeId) {
+                if ($verbose) {
+                    $this->output->writeln("Tree ID: $treeId");
+                }
+                $archive = $this->settings['projectRoot'] . '/' . LocalProject::ARCHIVE_DIR . '/' . $treeId . '.tar.gz';
+            }
+        }
+
+        if ($archive && file_exists($archive)) {
+            $message = "Extracting archive for application <info>$appIdentifier</info>";
+            $this->output->writeln($message);
+            $this->fsHelper->extractArchive($archive, $buildDir);
+        } else {
+            $message = "Building application <info>$appIdentifier</info>";
+            if (isset($appConfig['type'])) {
+                $message .= ' (runtime type: ' . $appConfig['type'] . ')';
+            }
+            $this->output->writeln($message);
+
+            $toolstack->build();
+
+            // We can only run post-build hooks for apps that actually have
+            // a separate build directory.
+            if (file_exists($buildDir)) {
+                if ($this->runPostBuildHooks($appConfig, $buildDir) === false) {
+                    // The user may not care if build hooks fail, but we should
+                    // not archive the result.
+                    $archive = false;
+                }
+            }
+            else {
+                $this->warnAboutHooks($appConfig, 'build');
+            }
+
+            if ($archive && $toolstack->canArchive()) {
+                $this->output->writeln("Saving build archive");
+                if (!is_dir(dirname($archive))) {
+                    mkdir(dirname($archive));
+                }
+                $this->fsHelper->archiveDir($buildDir, $archive);
+            }
+        }
+
+        $toolstack->install();
+
+        $webRoot = $toolstack->getWebRoot();
 
         // Symlink the built web root ($webRoot) into www or www/appIdentifier.
         if (!is_dir($webRoot)) {
@@ -324,19 +406,16 @@ class LocalBuild
 
             return false;
         }
-        $wwwLink = $projectRoot . '/' . LocalProject::WEB_ROOT;
         if ($multiApp) {
             $appDir = str_replace('/', '-', $appIdentifier);
-            if (is_link($wwwLink)) {
-                $this->fsHelper->remove($wwwLink);
+            if (is_link($destination)) {
+                $this->fsHelper->remove($destination);
             }
-            $wwwLink .= "/$appDir";
+            $destination .= "/$appDir";
         }
-        $symlinkTarget = $this->fsHelper->symlink($webRoot, $wwwLink);
 
-        if ($verbose) {
-            $this->output->writeln("Created symlink: $wwwLink -> $symlinkTarget");
-        }
+        $this->fsHelper->symlink($webRoot, $destination);
+        $this->output->writeln("Web root: $destination");
 
         $message = "Build complete for application <info>$appIdentifier</info>";
         $this->output->writeln($message);
@@ -411,7 +490,7 @@ class LocalBuild
         }
         $indent = '        ';
         $this->output->writeln(
-          "<comment>You have defined the following $hookType hook(s). The CLI will not run them locally.</comment>"
+          "<comment>You have defined the following $hookType hook(s). The CLI will not run them locally, unless you use the --copy option.</comment>"
         );
         $this->output->writeln("    $hookType: |");
         $hooks = (array) $appConfig['hooks'][$hookType];
@@ -455,6 +534,9 @@ class LocalBuild
 
     /**
      * @param string $projectRoot
+     *
+     * @throws \Exception If it cannot be determined whether or not a symlink
+     *                    points to a genuine active build.
      *
      * @return array The absolute paths to any active builds in the project.
      */
@@ -535,7 +617,7 @@ class LocalBuild
      *
      * @return int[]
      */
-    protected function cleanDirectory($directory, $maxAge = null, $keepMax = 5, array $blacklist = array(), $quiet = false)
+    protected function cleanDirectory($directory, $maxAge = null, $keepMax = 5, array $blacklist = array(), $quiet = true)
     {
         if (!is_dir($directory)) {
             return array(0, 0);

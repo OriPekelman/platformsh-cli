@@ -37,10 +37,8 @@ class Drupal extends ToolstackBase
         $finder->in($directory)
                ->files()
                ->depth($depth)
-               ->name('project.make')
-               ->name('project-core.make')
-               ->name('drupal-org.make')
-               ->name('drupal-org-core.make');
+               ->name('project.make*')
+               ->name('drupal-org.make*');
         foreach ($finder as $file) {
             return true;
         }
@@ -70,29 +68,31 @@ class Drupal extends ToolstackBase
 
     public function build()
     {
-        $this->setUpDrushFlags();
-
         $profiles = glob($this->appRoot . '/*.profile');
+        $projectMake = $this->findDrushMakeFile();
         if (count($profiles) > 1) {
             throw new \Exception("Found multiple files ending in '*.profile' in the directory.");
         } elseif (count($profiles) == 1) {
             $profileName = strtok(basename($profiles[0]), '.');
             $this->buildInProfileMode($profileName);
-        }
-        elseif (file_exists($this->appRoot . '/project.make')) {
-            $this->buildInProjectMode($this->appRoot . '/project.make');
+        } elseif ($projectMake) {
+            $this->buildInProjectMode($projectMake);
         } else {
             $this->output->writeln("Building in vanilla mode: you are missing out!");
 
-            $this->leaveInPlace = true;
+            $this->buildInPlace = true;
 
-            $this->copyGitIgnore('drupal/gitignore-vanilla');
-
-            $this->checkIgnored('sites/default/settings.local.php');
-            $this->checkIgnored('sites/default/files');
+            if ($this->copy) {
+                $this->fsHelper->copyAll($this->appRoot, $this->getBuildDir());
+            }
+            else {
+                $this->copyGitIgnore('drupal/gitignore-vanilla');
+                $this->checkIgnored('sites/default/settings.local.php');
+                $this->checkIgnored('sites/default/files');
+            }
         }
 
-        $this->symLinkSpecialDestinations();
+        $this->processSpecialDestinations();
     }
 
     /**
@@ -103,7 +103,10 @@ class Drupal extends ToolstackBase
      */
     protected function checkIgnored($filename, $suggestion = null)
     {
-        $repositoryDir = $this->projectRoot . '/' . LocalProject::REPOSITORY_DIR;
+        if (empty($this->settings['projectRoot'])) {
+            return;
+        }
+        $repositoryDir = $this->settings['projectRoot'] . '/' . LocalProject::REPOSITORY_DIR;
         $relative = $this->fsHelper->makePathRelative($this->appRoot . '/' . $filename, $repositoryDir);
         if (!$this->gitHelper->execute(array('check-ignore', $relative), $repositoryDir)) {
             $suggestion = $suggestion ?: $relative;
@@ -145,23 +148,92 @@ class Drupal extends ToolstackBase
     }
 
     /**
+     * Find the preferred Drush Make file in the app root.
+     *
+     * @param bool $required
+     * @param bool $core
+     *
+     * @throws \Exception
+     *
+     * @return string|false
+     *   The absolute filename of the make file.
+     */
+    protected function findDrushMakeFile($required = false, $core = false) {
+        $candidates = array(
+          'project.make.yml',
+          'project.make',
+          'drupal-org.make.yml',
+          'drupal-org.make',
+        );
+        if (empty($this->settings['drushUpdateLock'])) {
+            $candidates = array_merge(array(
+              'project.make.lock',
+              'project.make.yml.lock',
+              'drupal-org.make.yml.lock',
+              'drupal-org.make.lock',
+            ), $candidates);
+        }
+        foreach ($candidates as &$candidate) {
+            if ($core) {
+                $candidate = str_replace('.make', '-core.make', $candidate);
+            }
+            if (file_exists($this->appRoot . '/' . $candidate)) {
+                return $this->appRoot . '/' . $candidate;
+            }
+        }
+
+        if ($required) {
+            throw new \Exception(
+              ($core ? "Couldn't find a core make file in the directory." : "Couldn't find a make file in the directory.")
+              . " Possible filenames: " . implode(',', $candidates)
+            );
+        }
+
+        return false;
+    }
+
+    /**
+     * @return DrushHelper
+     */
+    protected function getDrushHelper()
+    {
+        static $drushHelper;
+        if (!isset($drushHelper)) {
+            $drushHelper = new DrushHelper($this->output);
+        }
+
+        return $drushHelper;
+    }
+
+    /**
      * Build in 'project' mode, i.e. just using a Drush make file.
      *
      * @param string $projectMake
      */
     protected function buildInProjectMode($projectMake)
     {
-        $drushHelper = new DrushHelper($this->output);
+        $drushHelper = $this->getDrushHelper();
         $drushHelper->ensureInstalled();
+        $this->setUpDrushFlags();
+
         $args = array_merge(
-          array('make', $projectMake, $this->getWebRoot()),
+          array('make', $projectMake, $this->getBuildDir()),
           $this->drushFlags
         );
+
+        // Create a lock file automatically.
+        if (!strpos($projectMake, '.lock') && version_compare($drushHelper->getVersion(), '7.0.0-rc1', '>=') && !empty($this->settings['drushUpdateLock'])) {
+            $args[] = "--lock=$projectMake.lock";
+        }
+
         $drushHelper->execute($args, null, true, false);
 
         $this->processSettingsPhp();
 
-        $this->ignoredFiles[] = 'project.make';
+        $this->ignoredFiles[] = '*.make';
+        $this->ignoredFiles[] = '*.make.lock';
+        $this->ignoredFiles[] = '*.make.yml';
+        $this->ignoredFiles[] = '*.make.yml.lock';
         $this->ignoredFiles[] = 'settings.local.php';
         $this->specialDestinations['sites.php'] = '{webroot}/sites';
 
@@ -169,10 +241,11 @@ class Drupal extends ToolstackBase
         // 'sites/default' directory.
         $this->fsHelper->symlinkAll(
           $this->appRoot,
-          $this->getWebRoot() . '/sites/default',
+          $this->getBuildDir() . '/sites/default',
           true,
           false,
-          array_merge($this->ignoredFiles, array_keys($this->specialDestinations))
+          array_merge($this->ignoredFiles, array_keys($this->specialDestinations)),
+          $this->copy
         );
     }
 
@@ -180,39 +253,30 @@ class Drupal extends ToolstackBase
      * Build in 'profile' mode: the application contains a site profile.
      *
      * @param string $profileName
-     *
-     * @throws \Exception
      */
     protected function buildInProfileMode($profileName)
     {
-        $drushHelper = new DrushHelper($this->output);
+        $drushHelper = $this->getDrushHelper();
         $drushHelper->ensureInstalled();
+        $this->setUpDrushFlags();
 
-        // Find the contrib make file.
-        if (file_exists($this->appRoot . '/project.make')) {
-            $projectMake = $this->appRoot . '/project.make';
-        } elseif (file_exists($this->appRoot . '/drupal-org.make')) {
-            $projectMake = $this->appRoot . '/drupal-org.make';
-        } else {
-            throw new \Exception("Couldn't find a project.make or drupal-org.make in the directory.");
-        }
-
-        // Find the core make file.
-        if (file_exists($this->appRoot . '/project-core.make')) {
-            $projectCoreMake = $this->appRoot . '/project-core.make';
-        } elseif (file_exists($this->appRoot . '/drupal-org-core.make')) {
-            $projectCoreMake = $this->appRoot . '/drupal-org-core.make';
-        } else {
-            throw new \Exception("Couldn't find a project-core.make or drupal-org-core.make in the directory.");
-        }
+        $projectMake = $this->findDrushMakeFile(true);
+        $projectCoreMake = $this->findDrushMakeFile(true, true);
 
         $args = array_merge(
-          array('make', $projectCoreMake, $this->getWebRoot()),
+          array('make', $projectCoreMake, $this->getBuildDir()),
           $this->drushFlags
         );
+
+        // Create a lock file automatically.
+        $updateLock = version_compare($drushHelper->getVersion(), '7.0.0-rc1', '>=') && !empty($this->settings['drushUpdateLock']);
+        if (!strpos($projectCoreMake, '.lock') && $updateLock) {
+            $args[] = "--lock=$projectCoreMake.lock";
+        }
+
         $drushHelper->execute($args, null, true, false);
 
-        $profileDir = $this->getWebRoot() . '/profiles/' . $profileName;
+        $profileDir = $this->getBuildDir() . '/profiles/' . $profileName;
         mkdir($profileDir, 0755, true);
 
         $this->output->writeln("Building the profile: <info>$profileName</info>");
@@ -221,12 +285,25 @@ class Drupal extends ToolstackBase
           array('make', '--no-core', '--contrib-destination=.', $projectMake),
           $this->drushFlags
         );
+
+        // Create a lock file automatically.
+        if (!strpos($projectMake, '.lock') && $updateLock) {
+            $args[] = "--lock=$projectMake.lock";
+        }
+
         $drushHelper->execute($args, $profileDir, true, false);
 
-        $this->output->writeln("Symlinking existing app files to the profile");
+        if ($this->copy) {
+            $this->output->writeln("Copying existing app files to the profile");
+        }
+        else {
+            $this->output->writeln("Symlinking existing app files to the profile");
+        }
 
-        $this->ignoredFiles[] = basename($projectMake);
-        $this->ignoredFiles[] = basename($projectCoreMake);
+        $this->ignoredFiles[] = '*.make';
+        $this->ignoredFiles[] = '*.make.lock';
+        $this->ignoredFiles[] = '*.make.yml';
+        $this->ignoredFiles[] = '*.make.yml.lock';
         $this->ignoredFiles[] = 'settings.local.php';
 
         $this->specialDestinations['settings*.php'] = '{webroot}/sites/default';
@@ -242,7 +319,8 @@ class Drupal extends ToolstackBase
           $profileDir,
           true,
           true,
-          array_merge($this->ignoredFiles, array_keys($this->specialDestinations))
+          array_merge($this->ignoredFiles, array_keys($this->specialDestinations)),
+          $this->copy
         );
     }
 
@@ -258,10 +336,14 @@ class Drupal extends ToolstackBase
      */
     protected function processSettingsPhp()
     {
+        if ($this->copy) {
+            // This behaviour only relates to symlinking.
+            return;
+        }
         $settingsPhpFile = $this->appRoot . '/settings.php';
         if (file_exists($settingsPhpFile)) {
             $this->output->writeln("Found a custom settings.php file: $settingsPhpFile");
-            copy($settingsPhpFile, $this->getWebRoot() . '/sites/default/settings.php');
+            $this->fsHelper->copy($settingsPhpFile, $this->getBuildDir() . '/sites/default/settings.php');
             $this->output->writeln(
               "<comment>Your settings.php file has been copied (not symlinked) into the build directory."
               . "\nYou will need to rebuild if you edit this file.</comment>"
@@ -285,7 +367,7 @@ class Drupal extends ToolstackBase
             $defaultSettingsPhp = '8/settings.php';
             $defaultSettingsLocal = '8/settings.local.php';
 
-            if (!file_exists($shared . '/config')) {
+            if ($shared && !file_exists($shared . '/config')) {
                 mkdir($shared . '/config/active', 0775, true);
                 mkdir($shared . '/config/staging', 0775, true);
             }
@@ -293,21 +375,21 @@ class Drupal extends ToolstackBase
 
         // Create a settings.php if it is missing.
         if (!file_exists($sitesDefault . '/settings.php')) {
-            copy($resources . '/' . $defaultSettingsPhp, $sitesDefault . '/settings.php');
+            $this->fsHelper->copy($resources . '/' . $defaultSettingsPhp, $sitesDefault . '/settings.php');
         }
 
         // Create the shared/settings.local.php if it doesn't exist. Everything
         // in shared will be symlinked into sites/default.
         $settingsLocal = $shared . '/settings.local.php';
-        if (!file_exists($settingsLocal)) {
+        if ($shared && !file_exists($settingsLocal)) {
             $this->output->writeln("Creating file: <info>$settingsLocal</info>");
-            copy($resources . '/' . $defaultSettingsLocal, $settingsLocal);
+            $this->fsHelper->copy($resources . '/' . $defaultSettingsLocal, $settingsLocal);
             $this->output->writeln('Edit this file to add your database credentials and other Drupal configuration.');
         }
 
         // Create a shared/files directory.
         $sharedFiles = "$shared/files";
-        if (!file_exists($sharedFiles)) {
+        if ($shared && !file_exists($sharedFiles)) {
             $this->output->writeln("Creating directory: <info>$sharedFiles</info>");
             $this->output->writeln('This is where Drupal can store public files.');
             mkdir($sharedFiles);
@@ -315,9 +397,13 @@ class Drupal extends ToolstackBase
             chmod($sharedFiles, 0775);
         }
 
-        // Symlink all files and folders from shared.
-        $this->output->writeln("Symlinking files from the 'shared' directory to sites/default");
-        $this->fsHelper->symlinkAll($shared, $sitesDefault);
+        // Symlink all files and folders from shared. The "copy" option is
+        // ignored, to avoid copying a huge sites/default/files directory every
+        // time.
+        if ($shared) {
+            $this->output->writeln("Symlinking files from the 'shared' directory to sites/default");
+            $this->fsHelper->symlinkAll($shared, $sitesDefault);
+        }
     }
 
     /**

@@ -3,7 +3,6 @@
 namespace Platformsh\Cli\Command;
 
 use Symfony\Component\Console\Input\InputInterface;
-use Symfony\Component\Console\Output\NullOutput;
 use Symfony\Component\Console\Output\OutputInterface;
 
 class WebCommand extends UrlCommandBase
@@ -21,15 +20,18 @@ class WebCommand extends UrlCommandBase
 
     protected function execute(InputInterface $input, OutputInterface $output)
     {
-        if ($this->isLoggedIn()) {
-            // If the user is logged in, select the appropriate project and
-            // environment.
-            $this->validateInput($input, new NullOutput());
-            $project = $this->getSelectedProject();
+        // Attempt to select the appropriate project and environment.
+        try {
+            $this->validateInput($input);
+        }
+        catch (\Exception $e) {
+            // Ignore errors.
         }
 
-        $url = 'https://marketplace.commerceguys.com/platform/login';
-        if (!empty($project)) {
+        $project = $this->hasSelectedProject() ? $this->getSelectedProject() : false;
+
+        $url = 'https://accounts.platform.sh/platform/login';
+        if ($project) {
             $url = $project->getLink('#ui');
             if ($this->hasSelectedEnvironment()) {
                 $environment = $this->getSelectedEnvironment();

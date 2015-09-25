@@ -4,8 +4,6 @@ namespace Platformsh\Cli\Command;
 
 use Stecman\Component\Symfony\Console\BashCompletion\Completion;
 use Stecman\Component\Symfony\Console\BashCompletion\CompletionCommand as ParentCompletionCommand;
-use Symfony\Component\Console\Input\ArrayInput;
-use Symfony\Component\Console\Output\NullOutput;
 
 class CompletionCommand extends ParentCompletionCommand
 {
@@ -36,10 +34,6 @@ class CompletionCommand extends ParentCompletionCommand
     {
         $this->platformCommand = new WelcomeCommand();
         $this->platformCommand->setApplication($this->getApplication());
-        $this->platformCommand->initialize(
-          new ArrayInput(['command' => 'welcome']),
-          new NullOutput()
-        );
         $this->projects = $this->getProjects();
     }
 
@@ -105,6 +99,26 @@ class CompletionCommand extends ParentCompletionCommand
               'domain:add',
               'chain',
               Completion::TYPE_OPTION
+            ),
+            new Completion\ShellPathCompletion(
+              'local:build',
+              'source',
+              Completion::TYPE_OPTION
+            ),
+            new Completion\ShellPathCompletion(
+              'local:build',
+              'destination',
+              Completion::TYPE_OPTION
+            ),
+            new Completion\ShellPathCompletion(
+              'environment:sql-dump',
+              'file',
+              Completion::TYPE_OPTION
+            ),
+            new Completion\ShellPathCompletion(
+              'local:init',
+              'directory',
+              Completion::TYPE_ARGUMENT
             )
           )
         );
@@ -173,8 +187,6 @@ class CompletionCommand extends ParentCompletionCommand
      * the command (via the 'id' argument of 'get', or the '--project' option),
      * or it is determined from the current path.
      *
-     * @todo filter to show only active environments for deactivate, etc.
-     *
      * @return string[]
      */
     public function getEnvironments()
@@ -206,7 +218,7 @@ class CompletionCommand extends ParentCompletionCommand
      */
     protected function getProjectIdFromCommandLine($commandLine)
     {
-        if (preg_match('/\W(\-\-project|get) ?=? ?[\'"]?([0-9a-z]+)[\'"]?/', $commandLine, $matches)) {
+        if (preg_match('/\W(\-\-project|\-p|get) ?=? ?[\'"]?([0-9a-z]+)[\'"]?/', $commandLine, $matches)) {
             return $matches[2];
         }
 
