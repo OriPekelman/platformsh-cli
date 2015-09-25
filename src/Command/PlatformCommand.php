@@ -352,6 +352,7 @@ abstract class PlatformCommand extends Command
      */
     public function getCurrentEnvironment(Project $expectedProject = null)
     {
+        
         if (!($projectRoot = $this->getProjectRoot())
           || !($project = $this->getCurrentProject())
           || ($expectedProject !== null && $expectedProject->id !== $project->id)) {

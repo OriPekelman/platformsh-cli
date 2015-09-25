@@ -348,4 +348,40 @@ class GitHelper extends Helper
 
         return $this->execute($args, $dir, $mustRun);
     }
+    
+    /**
+     * Tests if file or directory exist in git. Returns number of matches
+     *
+     * @param string $match
+     *   file or dirname to match
+     * @param string $dir
+     *   The path to a Git repository.
+     * @param bool   $mustRun
+     *   Enable exceptions if the Git command fails.
+     *
+     * @return integer
+     */
+    public function matchFile($name, $dir = null, $rootOnly =false , $prefixMatch= true, $mustRun = false)
+    {
+
+      $matches = 0;
+      $args = array('ls-files');
+      $files = explode(PHP_EOL, $this->execute($args, $dir, $mustRun));
+        foreach ($files as $file) {
+          if ($rootOnly){//match beginning
+            if ($prefixMatch){
+              if(stripos($file, $name) === 0){$matches++;}
+            } else {
+              echo $file."|";
+              echo $name."|";
+              echo "\n";
+              if($file==$name){$matches++;}
+            }
+          }
+          else {//match end
+            if(stripos(strrev($file), strrev($name)) === 0) {$matches++;}
+          }
+        }
+      return $matches;
+    }
 }
